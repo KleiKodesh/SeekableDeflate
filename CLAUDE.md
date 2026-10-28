@@ -1,7 +1,7 @@
 # SeekableDeflate
 
 Managed, seekable deflate (zran-style checkpoints) + zip-entry location. Extracted 2026-10-28 from
-WordDocumentRandomAccess (origin: that repo's `WordDocumentRandomAccess/Deflate` + `/Zip` at
+FastDocView (origin: that repo's `FastDocView/Deflate` + `/Zip` at
 commit 58e4dfc), which consumes it as a sibling-folder `ProjectReference`. No NuGet.
 
 Rules (same as the consumer's CLAUDE.md):
@@ -12,7 +12,7 @@ Rules (same as the consumer's CLAUDE.md):
 - Verify format facts in RFC 1951 / zlib source, never from memory.
 - Byte-exact correctness against .NET's `DeflateStream` is checked on every change
   (`SeekableDeflate.Tests`, must print ALL PASSED). A change that breaks the consumer's harness
-  (`WordDocumentRandomAccess.Tests -- --real …`) is not done.
+  (`FastDocView.Tests -- --real …`) is not done.
 - QA before each commit; a failed build stops the commit; commit as you go;
   author KleiKodesh, no Co-Authored-By trailer.
 - Rejected, don't re-propose: ZLibDotNet 0.1.1 (mis-decodes real data), .NET DeflateStream (no resume API).
