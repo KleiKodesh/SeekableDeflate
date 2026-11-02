@@ -40,18 +40,30 @@ public sealed class DeflateCheckpointInflater
     private int _pendingCopyLength;   // a match that did not fit the caller's buffer
     private int _pendingCopyDistance;
 
-    // the last captured, still-raw checkpoint: which of its window bytes a match of the following span copies from
-    private DeflateCheckpoint? _trackedCheckpoint;
-    private bool[]? _trackedReferenced;
-    private long _trackedSpanStart;
-    private int _trackedWindowStartOffset;   // uncompressed offset of the tracked window's first byte
+    // captured, still-raw checkpoints: which of their window bytes a match of the following 32 KB copies from.
+    // Several may be open at once (candidates of one region, see DeflateCheckpointSelector); each is sealed sparse
+    // once the output is 32 KB past it — nothing later can reach back over it.
+    private sealed class Tracked
+    {
+        public DeflateCheckpoint Checkpoint = null!;
+        public bool[]? Referenced;
+        public long SpanStart;           // = Checkpoint.UncompressedOffset
+        public long WindowStartOffset;   // uncompressed offset of the window's first byte
+    }
+    private readonly List<Tracked> _tracked = new();
     private DeflateCheckpoint? _lastResumedCheckpoint;
     private readonly byte[] _resumeWindow = new byte[DeflateCheckpoint.WindowSize];
 
     /// <summary>Raised just before a new block's header is read; <see cref="CaptureCheckpoint"/> is valid inside it.</summary>
     public event Action<DeflateCheckpointInflater>? BlockBoundaryReached;
 
+    /// <summary>Raised when a captured checkpoint's window is sealed (sparse): 32 KB of output past it, or the end of the stream.</summary>
+    public event Action<DeflateCheckpoint>? CheckpointSealed;
+
     public long TotalOut => _totalOut;
+
+    /// <summary>True at the boundary after the final block: the stream is over, a checkpoint there would be useless.</summary>
+    public bool IsPastFinalBlock => _isFinalBlock;
     public bool IsFinished => _state == State.Finished && _pendingCopyLength == 0;
 
     public DeflateCheckpointInflater(Stream input, long dataStart, long dataLength)
@@ -69,34 +81,48 @@ public sealed class DeflateCheckpointInflater
         for (int i = 0; i < windowLength; i++) window[i] = _window[(start + i) & WindowMask];
         var checkpoint = new DeflateCheckpoint(_bits.CompressedBytePosition, _bits.LeftoverBitCount, _bits.LeftoverBits,
                                                _totalOut, window);
-        SealTrackedCheckpoint();
-        _trackedCheckpoint = checkpoint;
-        _trackedReferenced = windowLength > 0 ? new bool[windowLength] : null;
-        _trackedSpanStart = _totalOut;
-        _trackedWindowStartOffset = (int)(_totalOut - windowLength);   // fits: windowLength == _totalOut while _totalOut < 32 KB
+        _tracked.Add(new Tracked
+        {
+            Checkpoint = checkpoint,
+            Referenced = windowLength > 0 ? new bool[windowLength] : null,
+            SpanStart = _totalOut,
+            WindowStartOffset = _totalOut - windowLength,
+        });
+        if (windowLength == 0) SealTracked(0);                 // nothing to track at the very start
         return checkpoint;
     }
 
-    /// <summary>
-    /// Seals the last captured checkpoint sparsely: its window keeps only the bytes a match in the span up to the
-    /// current position copied from. Called when the next checkpoint is captured and at the end of the stream; a span
-    /// shorter than the window (a later resume could still read into it) is sealed whole instead.
-    /// </summary>
+    /// <summary>Seals every tracked checkpoint the output has moved 32 KB past (and all of them at the end of the stream).</summary>
+    private void SealFinishedTracked()
+    {
+        while (_tracked.Count > 0 && (_totalOut - _tracked[0].SpanStart >= DeflateCheckpoint.WindowSize || _state == State.Finished))
+            SealTracked(0);
+    }
+
+    private void SealTracked(int index)
+    {
+        Tracked tracked = _tracked[index];
+        _tracked.RemoveAt(index);
+        tracked.Checkpoint.Seal(tracked.Referenced ?? new bool[0]);
+        CheckpointSealed?.Invoke(tracked.Checkpoint);
+    }
+
+    /// <summary>Seals every still-raw checkpoint now, sparsely when the output is 32 KB past it, else whole (kept for callers that stop reading early).</summary>
     public void SealTrackedCheckpoint()
     {
-        DeflateCheckpoint? tracked = _trackedCheckpoint;
-        if (tracked is null) return;
-        _trackedCheckpoint = null;
-        bool spanCoversWindow = _totalOut - _trackedSpanStart >= DeflateCheckpoint.WindowSize || IsFinished;
-        tracked.Seal(spanCoversWindow ? _trackedReferenced : null);
-        _trackedReferenced = null;
+        while (_tracked.Count > 0)
+        {
+            Tracked tracked = _tracked[0];
+            bool spanCoversWindow = _totalOut - tracked.SpanStart >= DeflateCheckpoint.WindowSize || IsFinished;
+            if (spanCoversWindow) SealTracked(0);
+            else { _tracked.RemoveAt(0); tracked.Checkpoint.Seal(null); CheckpointSealed?.Invoke(tracked.Checkpoint); }
+        }
     }
 
     public void ResumeFrom(DeflateCheckpoint checkpoint)
     {
         _bits.SeekTo(checkpoint.CompressedBytePosition, checkpoint.LeftoverBitCount, checkpoint.LeftoverBits);
-        _trackedCheckpoint = null;
-        _trackedReferenced = null;
+        _tracked.Clear();
         if (!ReferenceEquals(checkpoint, _lastResumedCheckpoint))
         {
             checkpoint.InflateWindowInto(_resumeWindow);   // ~0.03 ms for a sealed window; cached for repeated resumes at the same checkpoint
@@ -128,6 +154,7 @@ public sealed class DeflateCheckpointInflater
                 case State.Finished:
                     return written;
                 case State.BlockHeader:
+                    SealFinishedTracked();
                     BlockBoundaryReached?.Invoke(this);
                     ReadBlockHeader();
                     break;
@@ -144,7 +171,7 @@ public sealed class DeflateCheckpointInflater
 
     private void ReadBlockHeader()
     {
-        if (_isFinalBlock) { _state = State.Finished; SealTrackedCheckpoint(); return; }
+        if (_isFinalBlock) { _state = State.Finished; SealFinishedTracked(); return; }
         _isFinalBlock = _bits.ReadBits(1) == 1;
         switch (_bits.ReadBits(2))
         {
@@ -262,7 +289,7 @@ public sealed class DeflateCheckpointInflater
     {
         int toCopy = Math.Min(count, _pendingCopyLength);
         int distance = _pendingCopyDistance;
-        if (_trackedReferenced is not null) MarkReferenced(_totalOut - distance, toCopy);
+        if (_tracked.Count > 0) MarkReferenced(_totalOut - distance, toCopy);
         int source = (_windowPosition - distance) & WindowMask;
         bool wraps = source + toCopy > _window.Length || _windowPosition + toCopy > _window.Length;
         if (!wraps)
@@ -300,15 +327,19 @@ public sealed class DeflateCheckpointInflater
         return toCopy;
     }
 
-    /// <summary>Flags the tracked window bytes in [source, source + length) that lie before the span start.</summary>
+    /// <summary>Flags, for every tracked checkpoint, the window bytes in [source, source + length) that lie before its span start.</summary>
     private void MarkReferenced(long source, int length)
     {
-        long end = Math.Min(source + length, _trackedSpanStart);
-        if (source >= end) return;
-        bool[] referenced = _trackedReferenced!;
-        int first = (int)(source - _trackedWindowStartOffset), last = (int)(end - _trackedWindowStartOffset);
-        if (first < 0) first = 0;   // cannot happen (distance <= window), kept as a guard
-        for (int i = first; i < last; i++) referenced[i] = true;
+        foreach (Tracked tracked in _tracked)
+        {
+            if (tracked.Referenced is null) continue;
+            long end = Math.Min(source + length, tracked.SpanStart);
+            if (source >= end) continue;
+            int first = (int)(source - tracked.WindowStartOffset), last = (int)(end - tracked.WindowStartOffset);
+            if (first < 0) first = 0;   // cannot happen (distance <= window), kept as a guard
+            bool[] referenced = tracked.Referenced;
+            for (int i = first; i < last; i++) referenced[i] = true;
+        }
     }
 
     private byte EmitByte(byte value)

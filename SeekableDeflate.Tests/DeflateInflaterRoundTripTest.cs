@@ -49,8 +49,9 @@ public static class DeflateInflaterRoundTripTest
         TestReport.Check(inflated.AsSpan().SequenceEqual(original), "sequential inflate matches the original byte for byte");
         TestReport.Check(checkpoints.Count > 2, $"{checkpoints.Count} checkpoints captured");
         TestReport.Check(checkpoints[0].UncompressedOffset == 0, "first checkpoint is at offset 0");
-        // the loop above stops at the last byte without reading the final block header, so the last checkpoint seals on first use
-        TestReport.Check(checkpoints.Take(checkpoints.Count - 1).All(c => c.IsSealed), "every checkpoint is sealed (sparse window) once the next one is captured");
+        // the loop above stops at the last byte without reading the final block header, so the last checkpoint may seal on first use
+        TestReport.Check(checkpoints.Take(checkpoints.Count - 1).All(c => c.IsSealed), "every checkpoint is sealed (sparse window) 32 KB after its capture");
+        CheckpointSelectorTest.Run(original, compressed);
         long sealedBytes = checkpoints.Sum(c => (long)c.CompressedWindow.Length), rawBytes = checkpoints.Sum(c => (long)c.WindowLength);
         Console.WriteLine($"   windows: raw {rawBytes / 1024} KB -> sealed sparse {sealedBytes / 1024} KB");
         // the random seeks below run over the sealed sparse windows (round-tripped through storage like a sidecar does) and are
