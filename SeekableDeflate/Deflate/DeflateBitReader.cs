@@ -7,7 +7,8 @@ namespace SeekableDeflate;
 /// lacks: it can report its exact position (byte + leftover bits) and be re-seated there later —
 /// what makes a <see cref="DeflateCheckpoint"/> possible. Refills seven bytes at a time from a
 /// 64 KB buffer, so the hot decode loop touches the stream rarely and the bit buffer almost never
-/// runs dry mid-symbol.
+/// runs dry mid-symbol. The inflater's hot loop keeps the bit buffer in locals and hands the state
+/// back through <see cref="Export"/> / <see cref="Import"/>.
 /// </summary>
 internal sealed class DeflateBitReader
 {
@@ -46,6 +47,32 @@ internal sealed class DeflateBitReader
     public int LeftoverBitCount => _bitCount % 8;
 
     public int LeftoverBits => (int)(_bitBuffer & ((1UL << LeftoverBitCount) - 1));
+
+    /// <summary>The input bytes not yet taken into the bit buffer: the hot loop refills straight from them.</summary>
+    public byte[] Buffer => _buffer;
+    public int BufferLength => _bufferLength;
+
+    /// <summary>The bit-buffer state for a hot loop that keeps it in locals.</summary>
+    public void Export(out ulong bitBuffer, out int bitCount, out int bufferPosition, out int bufferLength)
+    {
+        bitBuffer = _bitBuffer;
+        bitCount = _bitCount;
+        bufferPosition = _bufferPosition;
+        bufferLength = _bufferLength;
+    }
+
+    public void Import(ulong bitBuffer, int bitCount, int bufferPosition)
+    {
+        _bitBuffer = bitBuffer;
+        _bitCount = bitCount;
+        _bufferPosition = bufferPosition;
+    }
+
+    /// <summary>
+    /// Loads the next input bytes into <see cref="Buffer"/> for a hot loop that found it empty (its state imported first);
+    /// false at the end of the region. Afterwards the loop exports the state again.
+    /// </summary>
+    public bool FillForLoop() => Fill();
 
     /// <summary>Tops the bit buffer up to at least 57 bits when input remains (seven bytes at once when they are in the buffer).</summary>
     public void Refill()

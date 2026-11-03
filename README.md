@@ -24,7 +24,7 @@ straight from the central directory, so a zip member can be made seekable in pla
 | `ZipEntryLocator`, `ZipEntryLocation`, `ZipStoredEntryStream` | zip entries in place |
 
 Typical cost: one checkpoint per ~1 MB of output = ~32 KB each (~3 % of the data); a random 64 KB
-read ≈ 2 ms. Used by [FastDocView](https://github.com/KleiKodesh/FastDocView)
+read ≈ 1 ms (the inflater runs ~370 MB/s on real XML, managed). Used by [FastDocView](https://github.com/KleiKodesh/FastDocView)
 to open huge .docx files instantly.
 
 ```

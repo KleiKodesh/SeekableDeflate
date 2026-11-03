@@ -7,8 +7,14 @@ commit 58e4dfc), which consumes it as a sibling-folder `ProjectReference`. No Nu
 Rules (same as the consumer's CLAUDE.md):
 - Fully managed: no P/Invoke, no reflection, `IsAotCompatible` on; net48 + net10.0 must both build.
 - **Speed: fix the implementation, never hide it** — no threading / pipelines / parallel loops.
-  Next work: rebuild the hot path on zlib's `inflate_fast` design (combined length/distance table
-  entries, fewer bounds checks). Baseline (91.6 MB XML): ~225–305 MB/s vs .NET zlib ~830 MB/s.
+  The hot loop (2026-11-03) follows zlib's `inflate_fast` / libdeflate: bit buffer in locals, 8-byte
+  refills, table entries that carry literal / base + extra bits, one linear output buffer with the
+  32 KB history in front, 8-byte word match copies (`Unsafe`). Real document.xml, sequential from a
+  checkpoint: 101 → 371 MB/s (.NET zlib 769 MB/s on the same box). Next lever if ever needed: feed
+  the span after a checkpoint to .NET's native `DeflateStream` as a synthetic stream — a stored
+  block holding the window, then the remaining compressed bytes re-packed by the checkpoint's
+  leftover-bit shift (no resume API needed; 32 KB of output to skip). Not done: our inflater is
+  within 2× and the read path stays one implementation.
 - Verify format facts in RFC 1951 / zlib source, never from memory.
 - Byte-exact correctness against .NET's `DeflateStream` is checked on every change
   (`SeekableDeflate.Tests`, must print ALL PASSED). A change that breaks the consumer's harness
