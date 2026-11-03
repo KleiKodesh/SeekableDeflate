@@ -42,6 +42,8 @@ public sealed class DeflateCheckpointInflater
     private int _outDelivered = WindowSize;
     private long _totalProduced;      // bytes produced, including the undelivered ones
     private long _totalOut;           // bytes handed to callers
+    private long _historyStart;       // the lowest offset whose byte in _out is real output (0 from the start; the checkpoint's offset after a resume)
+    private long _bytesInflated;      // every byte produced since construction, across resumes (a counter for measurements)
 
     private State _state = State.BlockHeader;
     private bool _isFinalBlock;
@@ -70,6 +72,23 @@ public sealed class DeflateCheckpointInflater
     public event Action<DeflateCheckpoint>? CheckpointSealed;
 
     public long TotalOut => _totalOut;
+
+    /// <summary>Every byte this inflater produced since it was made, resumes included (for measuring re-inflation).</summary>
+    public long BytesInflated => _bytesInflated;
+
+    /// <summary>The lowest offset still held in the output history, so <see cref="CopyFromHistory"/> can serve it
+    /// (at least the last 32 KB before <see cref="TotalOut"/>, once that much was produced).</summary>
+    public long HistoryStart => Math.Max(_historyStart, _totalOut - _outDelivered);
+
+    /// <summary>Copies already-delivered output at <paramref name="offset"/> (in [<see cref="HistoryStart"/>, <see cref="TotalOut"/>))
+    /// from the history, without inflating or moving the inflater. Returns the bytes copied.</summary>
+    public int CopyFromHistory(long offset, byte[] destination, int destinationOffset, int count)
+    {
+        if (offset < HistoryStart || offset >= _totalOut) throw new ArgumentOutOfRangeException(nameof(offset));
+        count = (int)Math.Min(count, _totalOut - offset);
+        Buffer.BlockCopy(_out, _outDelivered - (int)(_totalOut - offset), destination, destinationOffset, count);
+        return count;
+    }
 
     /// <summary>True at the boundary after the final block: the stream is over, a checkpoint there would be useless.</summary>
     public bool IsPastFinalBlock => _isFinalBlock;
@@ -140,6 +159,7 @@ public sealed class DeflateCheckpointInflater
         Buffer.BlockCopy(_resumeWindow, 0, _out, WindowSize - checkpoint.WindowLength, checkpoint.WindowLength);
         _outPosition = _outDelivered = WindowSize;
         _totalOut = _totalProduced = checkpoint.UncompressedOffset;
+        _historyStart = checkpoint.UncompressedOffset;   // the resumed window may be sparse (unreferenced bytes zeroed): not real output
         _state = State.BlockHeader;
         _isFinalBlock = false;
         _literalDecoder = _distanceDecoder = null;
@@ -259,6 +279,7 @@ public sealed class DeflateCheckpointInflater
         int toCopy = Math.Min(Math.Min(wanted, _storedRemaining), OutputEnd - _outPosition);
         for (int i = 0; i < toCopy; i++) _out[_outPosition++] = (byte)_bits.ReadBits(8);
         _totalProduced += toCopy;
+        _bytesInflated += toCopy;
         _storedRemaining -= toCopy;
         if (_storedRemaining == 0) _state = State.BlockHeader;
     }
@@ -383,6 +404,7 @@ public sealed class DeflateCheckpointInflater
         }
 
         _totalProduced += position - outStart;
+        _bytesInflated += position - outStart;
         _outPosition = position;
         reader.Import(hold, bits, inputPosition);
     }

@@ -3,7 +3,9 @@ namespace SeekableDeflate;
 /// <summary>
 /// A seekable, read-only view of the uncompressed content of a raw deflate region, backed by a
 /// list of checkpoints. A sequential read continues the running inflater; a seek elsewhere resumes
-/// from the nearest earlier checkpoint and skips forward (at most one checkpoint span, ~1 MB).
+/// from the nearest earlier checkpoint and skips forward (at most one checkpoint span, ~1 MB). A short seek back,
+/// into the output the inflater still holds as its history (at least the last 32 KB), is served from that
+/// history: no resume, nothing inflated again.
 /// </summary>
 public sealed class DeflateRandomAccessStream : Stream
 {
@@ -13,6 +15,20 @@ public sealed class DeflateRandomAccessStream : Stream
     private readonly byte[] _skipBuffer = new byte[1 << 16];
     private long _position;
     private bool _isInflaterSeated;   // false until the first read / after a failed resume
+
+    /// <summary>How many times a read resumed from a checkpoint (a measurement counter).</summary>
+    public int CheckpointResumeCount { get; private set; }
+
+    /// <summary>Every byte inflated since this stream was made, resumes and skips included (a measurement counter).</summary>
+    public long BytesInflated => _inflater.BytesInflated;
+
+    private static long _processCheckpointResumes, _processBytesInflated;
+
+    /// <summary>Checkpoint resumes of every stream in the process (a measurement counter for hosts that do not hold the stream).</summary>
+    public static long ProcessCheckpointResumeCount => Interlocked.Read(ref _processCheckpointResumes);
+
+    /// <summary>Bytes inflated by every stream in the process (a measurement counter).</summary>
+    public static long ProcessBytesInflated => Interlocked.Read(ref _processBytesInflated);
 
     public DeflateRandomAccessStream(Stream compressedInput, long dataStart, long dataLength,
                                      long uncompressedLength, IReadOnlyList<DeflateCheckpoint> checkpoints)
@@ -41,9 +57,17 @@ public sealed class DeflateRandomAccessStream : Stream
     {
         if (_position >= _length) return 0;
         count = (int)Math.Min(count, _length - _position);
+        if (_isInflaterSeated && _position < _inflater.TotalOut && _position >= _inflater.HistoryStart)
+        {
+            int copied = _inflater.CopyFromHistory(_position, buffer, offset, count);   // a short seek back: still in the history
+            _position += copied;
+            return copied;
+        }
+        long inflatedBefore = _inflater.BytesInflated;
         SeatInflaterAt(_position);
         int read = _inflater.Read(buffer, offset, count);
         _position += read;
+        Interlocked.Add(ref _processBytesInflated, _inflater.BytesInflated - inflatedBefore);
         return read;
     }
 
@@ -56,6 +80,8 @@ public sealed class DeflateRandomAccessStream : Stream
             DeflateCheckpoint checkpoint = _checkpoints[NearestCheckpointIndex(target)];
             _inflater.ResumeFrom(checkpoint);
             _isInflaterSeated = true;
+            CheckpointResumeCount++;
+            Interlocked.Increment(ref _processCheckpointResumes);
         }
         // Skip forward to the target (never more than one checkpoint span).
         while (_inflater.TotalOut < target)

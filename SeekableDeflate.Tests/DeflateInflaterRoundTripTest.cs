@@ -90,6 +90,66 @@ public static class DeflateInflaterRoundTripTest
             int read = ReadFully(stream, straddle);
             TestReport.Check(straddle.AsSpan(0, read).SequenceEqual(original.AsSpan((int)(boundary - straddle.Length / 2), read)), "read across a checkpoint boundary matches");
         }
+
+        RunBackSeekChecks(original, compressed, checkpoints);
+    }
+
+    /// <summary>
+    /// Back-seeks into the inflater's history (the last 32 KB it produced) are served from it: no checkpoint resume,
+    /// nothing inflated again. Distances at the edges (0, 1, 32 KB - 1, 32 KB) must not resume; 32 KB + 1 and a seek
+    /// back past the checkpoint a resume started from may resume — every read must match the original either way.
+    /// </summary>
+    private static void RunBackSeekChecks(byte[] original, byte[] compressed, IReadOnlyList<DeflateCheckpoint> checkpoints)
+    {
+        TestReport.Step("Back-seeks served from the inflater's history");
+        const int Window = DeflateCheckpoint.WindowSize;
+        var slice = new byte[4096];
+        bool Matches(DeflateRandomAccessStream stream, long offset)
+        {
+            stream.Position = offset;
+            int read = ReadFully(stream, slice);
+            return read > 0 && slice.AsSpan(0, read).SequenceEqual(original.AsSpan((int)offset, read));
+        }
+
+        // a target far enough into a span that 64 KB were produced since the checkpoint the read resumed from
+        DeflateCheckpoint seat = checkpoints[Math.Min(1, checkpoints.Count - 1)];
+        long target = seat.UncompressedOffset + 3 * Window;
+        foreach (int distance in new[] { 0, 1, Window - 1, Window, Window + 1 })
+        {
+            using var input = new MemoryStream(compressed);
+            var stream = new DeflateRandomAccessStream(input, 0, compressed.Length, original.Length, checkpoints);
+            stream.Position = target - 2 * Window;
+            ReadFully(stream, new byte[2 * Window]);          // the inflater now stands at target, 64 KB of history behind it
+            int resumes = stream.CheckpointResumeCount;
+            long inflated = stream.BytesInflated;
+            bool matches = Matches(stream, target - distance);
+            TestReport.Check(matches, $"back {distance} bytes: the read matches the original");
+            if (distance <= Window)
+                TestReport.Check(stream.CheckpointResumeCount == resumes && stream.BytesInflated - inflated <= Math.Max(0, slice.Length - distance) + 258,   // only the part of the read past the history (+ at most one match of overshoot)
+                    $"back {distance} bytes: served from the history (resumes +{stream.CheckpointResumeCount - resumes}, inflated +{stream.BytesInflated - inflated} B)");
+        }
+
+        // offset 0: read the first bytes, seek back to the very start
+        {
+            using var input = new MemoryStream(compressed);
+            var stream = new DeflateRandomAccessStream(input, 0, compressed.Length, original.Length, checkpoints);
+            ReadFully(stream, new byte[1000]);
+            int resumes = stream.CheckpointResumeCount;
+            TestReport.Check(Matches(stream, 0) && stream.CheckpointResumeCount == resumes, "back to offset 0: served from the history, matches");
+            TestReport.Check(Matches(stream, 1) && stream.CheckpointResumeCount == resumes, "then offset 1: served from the history, matches");
+        }
+
+        // right after a resume the history starts at the checkpoint (its window may be sparse): a seek before it resumes
+        if (checkpoints.Count > 2)
+        {
+            using var input = new MemoryStream(compressed);
+            var stream = new DeflateRandomAccessStream(input, 0, compressed.Length, original.Length, checkpoints);
+            long checkpoint = checkpoints[2].UncompressedOffset;
+            TestReport.Check(Matches(stream, checkpoint + 10), "read just after a checkpoint matches");
+            int resumes = stream.CheckpointResumeCount;
+            TestReport.Check(Matches(stream, checkpoint) && stream.CheckpointResumeCount == resumes, "back to the resumed checkpoint: from the history, matches");
+            TestReport.Check(Matches(stream, checkpoint - 1), "back one byte before the resumed checkpoint (sparse window, not history): matches");
+        }
     }
 
     private static int ReadFully(Stream stream, byte[] buffer)
