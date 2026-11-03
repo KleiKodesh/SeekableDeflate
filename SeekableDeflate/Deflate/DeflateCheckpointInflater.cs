@@ -267,6 +267,9 @@ public sealed class DeflateCheckpointInflater
     /// Decodes symbols until about <paramref name="wanted"/> bytes are produced (a match may run past), the pass area is
     /// full, or the block ends. The bit buffer, the input position and the output position are locals for the duration.
     /// </summary>
+#if NET
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]   // fully optimised from the first call: the tiered JIT's tier-0 version of this loop ran at a quarter of the speed for the first seconds of a process (a reopen's first windows)
+#endif
     private void ProduceHuffman(int wanted)
     {
         MakeRoom();

@@ -9,8 +9,11 @@ Rules (same as the consumer's CLAUDE.md):
 - **Speed: fix the implementation, never hide it** — no threading / pipelines / parallel loops.
   The hot loop (2026-11-03) follows zlib's `inflate_fast` / libdeflate: bit buffer in locals, 8-byte
   refills, table entries that carry literal / base + extra bits, one linear output buffer with the
-  32 KB history in front, 8-byte word match copies (`Unsafe`). Real document.xml, sequential from a
-  checkpoint: 101 → 371 MB/s (.NET zlib 769 MB/s on the same box). Next lever if ever needed: feed
+  32 KB history in front, 8-byte word match copies (`Unsafe`), `AggressiveOptimization` on the loop.
+  Real document.xml, sequential from a checkpoint: ~350-450 MB/s at steady state — the same as the
+  previous loop once the tiered JIT had promoted it; the gain is that it runs at that speed from the
+  first call, where the old one spent its first seconds (tens of MB) at ~90 MB/s in tier-0 code
+  (the "95 MB/s" measured in FastDocView NOTES was that). .NET zlib: ~770 MB/s. Next lever: feed
   the span after a checkpoint to .NET's native `DeflateStream` as a synthetic stream — a stored
   block holding the window, then the remaining compressed bytes re-packed by the checkpoint's
   leftover-bit shift (no resume API needed; 32 KB of output to skip). Not done: our inflater is
