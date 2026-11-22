@@ -90,6 +90,7 @@ public static class ZipEntryLocator
 
     private static long DataOffsetFromLocalHeader(Stream zip, BinaryReader reader, long localHeaderOffset)
     {
+        if (localHeaderOffset < 0 || localHeaderOffset > zip.Length - 30) throw new InvalidDataException("Zip: bad local file header.");
         zip.Position = localHeaderOffset;
         if (reader.ReadUInt32() != LocalFileHeaderSignature) throw new InvalidDataException("Zip: bad local file header.");
         zip.Position += 22;                                        // up to the name length field
@@ -110,9 +111,10 @@ public static class ZipEntryLocator
             if (id == 0x0001)
             {
                 int field = position;
-                if (uncompressedSize == 0xFFFFFFFF && field + 8 <= position + size) { uncompressedSize = BitConverter.ToInt64(extra, field); field += 8; }
-                if (compressedSize == 0xFFFFFFFF && field + 8 <= position + size) { compressedSize = BitConverter.ToInt64(extra, field); field += 8; }
-                if (localHeaderOffset == 0xFFFFFFFF && field + 8 <= position + size) localHeaderOffset = BitConverter.ToInt64(extra, field);
+                int fieldsEnd = Math.Min(position + size, extra.Length);   // a field that claims more than the extra holds: only what is there
+                if (uncompressedSize == 0xFFFFFFFF && field + 8 <= fieldsEnd) { uncompressedSize = BitConverter.ToInt64(extra, field); field += 8; }
+                if (compressedSize == 0xFFFFFFFF && field + 8 <= fieldsEnd) { compressedSize = BitConverter.ToInt64(extra, field); field += 8; }
+                if (localHeaderOffset == 0xFFFFFFFF && field + 8 <= fieldsEnd) localHeaderOffset = BitConverter.ToInt64(extra, field);
                 return;
             }
             position += size;

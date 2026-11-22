@@ -5,6 +5,7 @@ int megabytes = 8;
 for (int i = 0; i < args.Length; i++)
     if (args[i] == "--megabytes") megabytes = int.Parse(args[++i]);
 
+ZipEntryLocatorTest.Run();
 DeflateInflaterRoundTripTest.Run(megabytes);
 
 Console.WriteLine();
