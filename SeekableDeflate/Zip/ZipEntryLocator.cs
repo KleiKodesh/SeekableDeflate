@@ -17,41 +17,74 @@ public static class ZipEntryLocator
     private const uint LocalFileHeaderSignature = 0x04034b50;
     private const int MaxCommentLength = 0xFFFF;
 
+    /// <summary>
+    /// The entry named <paramref name="entryName"/> (case-insensitive), or null. The central directory is read in one
+    /// block and only the match's local header is read: a package with a thousand parts is one read, not a seek per part.
+    /// </summary>
     public static ZipEntryLocation? Locate(Stream zip, string entryName)
     {
-        foreach (ZipEntryLocation entry in EnumerateEntries(zip))
-            if (string.Equals(entry.Name, entryName, StringComparison.OrdinalIgnoreCase)) return entry;
+        foreach (CentralDirectoryEntry entry in ReadCentralDirectory(zip))
+            if (string.Equals(entry.Name, entryName, StringComparison.OrdinalIgnoreCase)) return LocationOf(zip, entry);
         return null;
     }
 
     public static IEnumerable<ZipEntryLocation> EnumerateEntries(Stream zip)
     {
-        (long centralDirectoryOffset, long entryCount) = FindCentralDirectory(zip);
+        foreach (CentralDirectoryEntry entry in ReadCentralDirectory(zip)) yield return LocationOf(zip, entry);
+    }
+
+    private readonly record struct CentralDirectoryEntry(string Name, ushort Method, uint Crc, long CompressedSize, long UncompressedSize, long LocalHeaderOffset);
+
+    private static ZipEntryLocation LocationOf(Stream zip, CentralDirectoryEntry entry)
+    {
         var reader = new BinaryReader(zip, Encoding.UTF8, leaveOpen: true);
+        long dataOffset = DataOffsetFromLocalHeader(zip, reader, entry.LocalHeaderOffset);
+        return new ZipEntryLocation(entry.Name, dataOffset, entry.CompressedSize, entry.UncompressedSize, entry.Method, entry.Crc);
+    }
+
+    /// <summary>The central directory entries in order, parsed from one read of the directory (APPNOTE 4.3.12), as they are asked for.</summary>
+    private static IEnumerable<CentralDirectoryEntry> ReadCentralDirectory(Stream zip)
+    {
+        (long centralDirectoryOffset, long entryCount, long recordedSize) = FindCentralDirectory(zip);
+        if (centralDirectoryOffset < 0 || centralDirectoryOffset > zip.Length) throw new InvalidDataException("Zip: bad central directory entry.");
+        // read the recorded size in one go; a directory whose recorded size is short is read further as its entries need
+        long available = zip.Length - centralDirectoryOffset;
+        var directory = new byte[(int)Math.Min(Math.Min(Math.Max(recordedSize, 46), available), int.MaxValue)];
         zip.Position = centralDirectoryOffset;
+        ReadExactly(zip, directory);
+        int loaded = directory.Length;
+        bool Ensure(int end)
+        {
+            if (end <= loaded) return true;
+            if (end > available) return false;
+            int size = (int)Math.Min(Math.Max((long)end, (long)loaded * 2), Math.Min(available, int.MaxValue));
+            Array.Resize(ref directory, size);
+            zip.Position = centralDirectoryOffset + loaded;
+            ReadExactly(zip, directory, loaded, size - loaded);
+            loaded = size;
+            return true;
+        }
+        int position = 0;
         for (long i = 0; i < entryCount; i++)
         {
-            if (reader.ReadUInt32() != CentralFileHeaderSignature) throw new InvalidDataException("Zip: bad central directory entry.");
-            zip.Position += 6;                                     // version made by, version needed, flags
-            ushort method = reader.ReadUInt16();
-            zip.Position += 4;                                     // time, date
-            uint crc = reader.ReadUInt32();
-            long compressedSize = reader.ReadUInt32();
-            long uncompressedSize = reader.ReadUInt32();
-            int nameLength = reader.ReadUInt16();
-            int extraLength = reader.ReadUInt16();
-            int commentLength = reader.ReadUInt16();
-            zip.Position += 8;                                     // disk start, internal/external attributes
-            long localHeaderOffset = reader.ReadUInt32();
-            string name = Encoding.UTF8.GetString(reader.ReadBytes(nameLength));
-            byte[] extra = reader.ReadBytes(extraLength);
-            zip.Position += commentLength;
-            long afterEntry = zip.Position;
-
+            if (!Ensure(position + 46) || BitConverter.ToUInt32(directory, position) != CentralFileHeaderSignature)
+                throw new InvalidDataException("Zip: bad central directory entry.");
+            ushort method = BitConverter.ToUInt16(directory, position + 10);
+            uint crc = BitConverter.ToUInt32(directory, position + 16);
+            long compressedSize = BitConverter.ToUInt32(directory, position + 20);
+            long uncompressedSize = BitConverter.ToUInt32(directory, position + 24);
+            int nameLength = BitConverter.ToUInt16(directory, position + 28);
+            int extraLength = BitConverter.ToUInt16(directory, position + 30);
+            int commentLength = BitConverter.ToUInt16(directory, position + 32);
+            long localHeaderOffset = BitConverter.ToUInt32(directory, position + 42);
+            int nameStart = position + 46;
+            if (!Ensure(nameStart + nameLength + extraLength)) throw new EndOfStreamException();
+            string name = Encoding.UTF8.GetString(directory, nameStart, nameLength);
+            var extra = new byte[extraLength];
+            Buffer.BlockCopy(directory, nameStart + nameLength, extra, 0, extraLength);
             ReadZip64Extra(extra, ref uncompressedSize, ref compressedSize, ref localHeaderOffset);
-            long dataOffset = DataOffsetFromLocalHeader(zip, reader, localHeaderOffset);
-            zip.Position = afterEntry;
-            yield return new ZipEntryLocation(name, dataOffset, compressedSize, uncompressedSize, method, crc);
+            position = nameStart + nameLength + extraLength + commentLength;
+            yield return new CentralDirectoryEntry(name, method, crc, compressedSize, uncompressedSize, localHeaderOffset);
         }
     }
 
@@ -86,7 +119,7 @@ public static class ZipEntryLocator
         }
     }
 
-    private static (long offset, long entryCount) FindCentralDirectory(Stream zip)
+    private static (long offset, long entryCount, long size) FindCentralDirectory(Stream zip)
     {
         long searchStart = Math.Max(0, zip.Length - MaxCommentLength - 22);
         var tail = new byte[zip.Length - searchStart];
@@ -97,18 +130,19 @@ public static class ZipEntryLocator
         {
             if (BitConverter.ToUInt32(tail, i) != EndOfCentralDirectorySignature) continue;
             long entryCount = BitConverter.ToUInt16(tail, i + 10);
+            long size = BitConverter.ToUInt32(tail, i + 12);
             long offset = BitConverter.ToUInt32(tail, i + 16);
-            if (entryCount == 0xFFFF || offset == 0xFFFFFFFF)
+            if (entryCount == 0xFFFF || offset == 0xFFFFFFFF || size == 0xFFFFFFFF)
             {
                 long endRecordPosition = searchStart + i;
-                (offset, entryCount) = ReadZip64EndRecord(zip, endRecordPosition) ?? (offset, entryCount);
+                (offset, entryCount, size) = ReadZip64EndRecord(zip, endRecordPosition) ?? (offset, entryCount, size);
             }
-            return (offset, entryCount);
+            return (offset, entryCount, size);
         }
         throw new InvalidDataException("Zip: end of central directory not found.");
     }
 
-    private static (long offset, long entryCount)? ReadZip64EndRecord(Stream zip, long endRecordPosition)
+    private static (long offset, long entryCount, long size)? ReadZip64EndRecord(Stream zip, long endRecordPosition)
     {
         long locatorPosition = endRecordPosition - 20;
         if (locatorPosition < 0) return null;
@@ -121,17 +155,19 @@ public static class ZipEntryLocator
         if (reader.ReadUInt32() != Zip64EndRecordSignature) return null;
         zip.Position += 8 + 2 + 2 + 4 + 4 + 8;                     // size, versions, disks, entries on this disk
         long entryCount = reader.ReadInt64();
-        zip.Position += 8;                                         // central directory size
+        long size = reader.ReadInt64();
         long offset = reader.ReadInt64();
-        return (offset, entryCount);
+        return (offset, entryCount, size);
     }
 
-    private static void ReadExactly(Stream stream, byte[] buffer)
+    private static void ReadExactly(Stream stream, byte[] buffer) => ReadExactly(stream, buffer, 0, buffer.Length);
+
+    private static void ReadExactly(Stream stream, byte[] buffer, int offset, int count)
     {
         int filled = 0;
-        while (filled < buffer.Length)
+        while (filled < count)
         {
-            int read = stream.Read(buffer, filled, buffer.Length - filled);
+            int read = stream.Read(buffer, offset + filled, count - filled);
             if (read <= 0) throw new EndOfStreamException();
             filled += read;
         }
